@@ -1006,28 +1006,79 @@ function migrateProducts(loadedDb) {
   return loadedDb;
 }
 
+// ── Utilidad JSONP: evita CORS inyectando un <script> tag ──
+function jsonpGet(url) {
+  return new Promise((resolve, reject) => {
+    const cbName = '_gsCallback_' + Date.now();
+    const script = document.createElement('script');
+    const timer = setTimeout(() => {
+      delete window[cbName];
+      document.body.removeChild(script);
+      reject(new Error('JSONP timeout'));
+    }, 15000);
+    window[cbName] = (data) => {
+      clearTimeout(timer);
+      delete window[cbName];
+      try { document.body.removeChild(script); } catch {}
+      resolve(data);
+    };
+    script.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cbName + '&t=' + Date.now();
+    script.onerror = () => {
+      clearTimeout(timer);
+      delete window[cbName];
+      try { document.body.removeChild(script); } catch {}
+      reject(new Error('JSONP error'));
+    };
+    document.body.appendChild(script);
+  });
+}
+
+// ── POST via form (evita CORS para escritura) ──
+function formPost(url, data) {
+  return new Promise((resolve, reject) => {
+    const cbName = '_gsWriteCallback_' + Date.now();
+    const script = document.createElement('script');
+    const timer = setTimeout(() => {
+      delete window[cbName];
+      try { document.body.removeChild(script); } catch {}
+      reject(new Error('Write timeout'));
+    }, 20000);
+    window[cbName] = (result) => {
+      clearTimeout(timer);
+      delete window[cbName];
+      try { document.body.removeChild(script); } catch {}
+      resolve(result);
+    };
+    // Codificar los datos como parámetro URL para JSONP POST
+    const encoded = encodeURIComponent(JSON.stringify(data));
+    script.src = url + '?callback=' + cbName + '&action=write&secret=' + encodeURIComponent(GAS_SECRET) + '&payload=' + encoded + '&t=' + Date.now();
+    script.onerror = () => {
+      clearTimeout(timer);
+      delete window[cbName];
+      try { document.body.removeChild(script); } catch {}
+      reject(new Error('Write error'));
+    };
+    document.body.appendChild(script);
+  });
+}
+
 async function loadDB() {
   showLoading('Cargando datos…');
-  // ── Intentar cargar desde Google Sheets via Apps Script ──
   if (GAS_URL && GAS_URL !== 'PEGAR_AQUI_LA_URL_DE_TU_WEB_APP') {
     try {
-      const resp = await fetch(`${GAS_URL}?action=read&t=${Date.now()}`);
-      const json = await resp.json();
+      const json = await jsonpGet(GAS_URL + '?action=read');
       if (json.ok && json.data) {
-        // json.data puede ser string JSON (del servidor) o ya objeto si Apps Script lo devolvió parseado
         const raw = typeof json.data === 'string' ? json.data : JSON.stringify(json.data);
         db = migrateProducts(JSON.parse(raw));
         if (!db.users    || !db.users.length)    db.users    = DEFAULT_USERS;
         if (!db.movements) db.movements = [];
         if (!db.orders)    db.orders    = [];
         setSyncStatus('online');
-        // Guardar copia local como respaldo offline
         try { localStorage.setItem(SHARED_KEY, JSON.stringify(db)); } catch {}
       } else {
         throw new Error(json.error || 'Sin datos en servidor');
       }
     } catch(gasErr) {
-      // Fallback: usar copia local si el servidor no responde
       const local = localStorage.getItem(SHARED_KEY) || localStorage.getItem('alumstock_v4');
       if (local) {
         try { db = migrateProducts(JSON.parse(local)); setSyncStatus('offline'); }
@@ -1038,7 +1089,6 @@ async function loadDB() {
       }
     }
   } else {
-    // Modo sin servidor: solo localStorage (útil durante desarrollo)
     const local = localStorage.getItem(SHARED_KEY) || localStorage.getItem('alumstock_v4');
     if (local) { try { db = migrateProducts(JSON.parse(local)); } catch { db = {}; } }
     if (!db.products || !db.products.length) db.products = DEFAULT_PRODUCTS.map(p=>({...p}));
@@ -1054,20 +1104,13 @@ async function loadDB() {
 async function saveDB() {
   db.lastSync = new Date().toISOString();
   const jsonStr = JSON.stringify(db);
-  // Guardar siempre en local como respaldo offline
   try { localStorage.setItem(SHARED_KEY, jsonStr); } catch {}
-
   if (!GAS_URL || GAS_URL === 'PEGAR_AQUI_LA_URL_DE_TU_WEB_APP') {
     setSyncStatus('local'); return;
   }
   try {
-    const resp = await fetch(GAS_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'write', secret: GAS_SECRET, data: jsonStr })
-    });
-    const result = await resp.json();
-    setSyncStatus(result.ok ? 'online' : 'offline');
+    const result = await formPost(GAS_URL, { data: jsonStr });
+    setSyncStatus(result && result.ok ? 'online' : 'offline');
   } catch {
     setSyncStatus('offline');
   }
@@ -1099,8 +1142,7 @@ setInterval(async () => {
   if (!GAS_URL || GAS_URL === 'PEGAR_AQUI_LA_URL_DE_TU_WEB_APP') return;
   try {
     // Primero verificar solo el timestamp (una celda, rapidísimo)
-    const tsResp = await fetch(`${GAS_URL}?action=read&t=${Date.now()}`);
-    const tsJson = await tsResp.json();
+    const tsJson = await jsonpGet(GAS_URL + '?action=read');
     if (!tsJson.ok || !tsJson.data) return;
     const raw = typeof tsJson.data === 'string' ? tsJson.data : JSON.stringify(tsJson.data);
     const remote = JSON.parse(raw);
@@ -1122,8 +1164,7 @@ async function manualSync() {
   }
   setSyncStatus('syncing');
   try {
-    const resp = await fetch(`${GAS_URL}?action=read&t=${Date.now()}`);
-    const json = await resp.json();
+    const json = await jsonpGet(GAS_URL + '?action=read');
     if (json.ok && json.data) {
       const raw = typeof json.data === 'string' ? json.data : JSON.stringify(json.data);
       const remote = JSON.parse(raw);
